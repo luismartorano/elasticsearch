@@ -1,0 +1,382 @@
+#ELASTICSEARCH
+---
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch
+  namespace: elastic-system
+spec:
+  version: 8.5.3
+  volumeClaimDeletePolicy: DeleteOnScaledownOnly
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: observability 
+    logs:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: observability
+  nodeSets:
+  - name: master
+    count: 1
+    config:
+      node.roles: ["master", "data", "ingest", "ml", "remote_cluster_client"]
+      node.store.allow_mmap: false
+    podTemplate:
+      spec:
+        initContainers:
+          - name: sysctl
+            securityContext:
+              privileged: true
+              runAsUser: 0
+            command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+        containers:
+        - name: elasticsearch
+          env:
+          - name: ES_JAVA_OPTS
+            value: -Xms2g -Xmx2g
+          resources:
+            requests:
+              memory: 800Mi
+              cpu: 500m
+            limits:
+              memory: 1Gi
+              cpu: 1
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data # Do not change this name unless you set up a volume mount for the data path.
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+        storageClassName: standard
+      
+---
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kibana
+  namespace: elastic-system
+spec:
+  version: 8.5.3
+  elasticsearchRef:
+    name: elasticsearch
+  config:
+    xpack.fleet.agents.elasticsearch.hosts: ["https://elasticsearch-es-http.elastic-system.svc:9200"]
+    xpack.fleet.agents.fleet_server.hosts: ["https://fleet-server-agent-http.elastic-system.svc:8220"]
+    xpack.fleet.packages:
+    - name: system
+      version: latest
+    - name: elastic_agent
+      version: latest
+    - name: fleet_server
+      version: latest
+    - name: kubernetes
+      version: latest
+    - name: apm
+      version: latest
+    - name: log
+      version: latest  
+    xpack.fleet.agentPolicies:
+    - name: Fleet Server on ECK policy
+      id: eck-fleet-server
+      namespace: elastic-system
+      monitoring_enabled:
+      - logs
+      - metrics
+      unenroll_timeout: 900
+      is_default_fleet_server: true
+      package_policies:
+      - name: fleet_server-1
+        id: fleet_server-1
+        package:
+          name: fleet_server
+    - name: Elastic Agent on ECK policy
+      id: eck-agent
+      namespace: elastic-system
+      monitoring_enabled:
+      - logs
+      - metrics
+      unenroll_timeout: 900  
+      is_default: true
+      package_policies:
+      - name: system-1
+        id: system-1
+        package:
+          name: system
+      - package:
+          name: apm
+        name: apm-1
+        inputs:
+        - type: apm
+          enabled: true
+          vars:
+          - name: host
+            value: 0.0.0.0:8200
+      - package:
+          name: kubernetes
+        name: kubernetes-1
+
+      - package:
+          name: log
+        name: log-1
+        inputs:
+        - type: logfile
+          enabled: true
+          streams:
+          - data_stream:
+              dataset: log.log
+            enabled: true
+            vars:
+            - name: paths
+              value:
+              - '/var/log/containers/*${kubernetes.container.id}.log'
+            - name: custom
+              value: |
+                symlinks: true
+                condition: ${kubernetes.namespace} == 'default'
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: observability 
+    logs:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: observability 
+  count: 1
+
+
+#APM SERVER
+---
+apiVersion: apm.k8s.elastic.co/v1
+kind: ApmServer
+metadata:
+  name: apmserver
+  namespace: elastic-system
+spec:
+  version: 8.5.3
+  podTemplate:
+    spec:
+      containers:
+      - name: apm-server
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 0.5
+          limits:
+            memory: 1Gi
+            cpu: 1
+
+#APM SERVICE
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apm
+  namespace: elastic-system
+spec:
+  selector:
+    agent.k8s.elastic.co/name: elastic-agent
+  ports:
+  - protocol: TCP
+    port: 8200
+
+#BEATS
+---
+apiVersion: beat.k8s.elastic.co/v1beta1
+kind: Beat
+metadata:
+  name: beats
+  namespace: elastic-system
+spec:
+  type: filebeat
+  version: 8.5.3
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: elastic-system 
+    logs:
+      elasticsearchRefs:
+      - name: monitoring
+        namespace: elastic-system
+  deployment:
+    podTemplate:
+      spec:
+        containers:
+        - name: filebeat
+          resources:
+            requests:
+              memory: 300Mi
+              cpu: 0.5
+            limits:
+              memory: 500Mi
+              cpu: 0.5
+#AGENT
+---
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata:
+  name: fleet-server
+spec:
+  version: 8.4.2
+  kibanaRef:
+    name: kibana
+  elasticsearchRefs:
+  - name: elasticsearch
+  mode: fleet
+  fleetServerEnabled: true
+  deployment:
+    replicas: 1
+    podTemplate:
+      spec:
+        serviceAccountName: fleet-server
+        automountServiceAccountToken: true
+        securityContext:
+          runAsUser: 0
+
+---
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata: 
+  name: elastic-agent
+spec:
+  version: 8.4.2
+  kibanaRef:
+    name: kibana
+  fleetServerRef: 
+    name: fleet-server
+  mode: fleet
+  daemonSet:
+    podTemplate:
+      spec:
+        serviceAccountName: elastic-agent
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        automountServiceAccountToken: true
+        securityContext:
+          runAsUser: 0
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-server
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - namespaces
+  - nodes
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups: ["coordination.k8s.io"]
+  resources:
+  - leases
+  verbs:
+  - get
+  - create
+  - update
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-server
+  namespace: elastic-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fleet-server
+subjects:
+- kind: ServiceAccount
+  name: fleet-server
+  namespace: elastic-system
+roleRef:
+  kind: ClusterRole
+  name: fleet-server
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: elastic-agent
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - nodes
+  - namespaces
+  - events
+  - services
+  - configmaps
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups: ["coordination.k8s.io"]
+  resources:
+  - leases
+  verbs:
+  - get
+  - create
+  - update
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+- apiGroups: ["extensions"]
+  resources:
+    - replicasets
+  verbs: 
+  - "get"
+  - "list"
+  - "watch"
+- apiGroups:
+  - "apps"
+  resources:
+  - statefulsets
+  - deployments
+  - replicasets
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
+- apiGroups:
+  - ""
+  resources:
+  - nodes/stats
+  verbs:
+  - get
+- apiGroups:
+  - "batch"
+  resources:
+  - jobs
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent
+  namespace: elastic-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: elastic-agent
+subjects:
+- kind: ServiceAccount
+  name: elastic-agent
+  namespace: elastic-system
+roleRef:
+  kind: ClusterRole
+  name: elastic-agent
+  apiGroup: rbac.authorization.k8s.io
